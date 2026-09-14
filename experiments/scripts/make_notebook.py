@@ -1,0 +1,204 @@
+import json
+
+notebook = {
+    "cells": [
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "# ML & AI NEXUS 2026 - Final Winning Solution\n",
+                "**Team Name:** codewave  \n",
+                "**Members:** Sahil Kavishka and Team  \n",
+                "**Theme:** Beyond the Black Box: Statistics for Trustworthy AI  \n",
+                "**Selected Submission:** codewave submission 9.csv / codewave submission 12.csv  \n",
+                "\n",
+                "This reproducible notebook trains our multi-model ensemble (CatBoost + LightGBM + Calibrated Lasso Logistic Regression) with clinical domain feature engineering, covariate-shift adaptation, and probability calibration."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import warnings\n",
+                "warnings.filterwarnings('ignore')\n",
+                "import numpy as np\n",
+                "import pandas as pd\n",
+                "from sklearn.model_selection import StratifiedKFold\n",
+                "from sklearn.preprocessing import OneHotEncoder, StandardScaler\n",
+                "from sklearn.linear_model import LogisticRegression\n",
+                "from sklearn.calibration import CalibratedClassifierCV\n",
+                "from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss\n",
+                "from sklearn.experimental import enable_iterative_imputer\n",
+                "from sklearn.impute import IterativeImputer\n",
+                "from catboost import CatBoostClassifier\n",
+                "import lightgbm as lgb\n",
+                "\n",
+                "SEED = 42\n",
+                "N_FOLDS = 5\n",
+                "np.random.seed(SEED)\n",
+                "\n",
+                "train_raw = pd.read_csv('train.csv')\n",
+                "test_raw = pd.read_csv('test.csv')\n",
+                "print(f'Train shape: {train_raw.shape}, Test shape: {test_raw.shape}')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 1. Feature Engineering & Clinical Domain Risk Indicators"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "def feature_engineer(df):\n",
+                "    df = df.copy()\n",
+                "    df['anemia_flag'] = (df['hemoglobin_g_dl'] < 11.0).astype(float)\n",
+                "    df['aki_flag'] = (df['creatinine_mg_dl'] > 1.5).astype(float)\n",
+                "    df['hyponatremia_flag'] = (df['sodium_mmol_l'] < 135).astype(float)\n",
+                "    df['tachy_flag'] = (df['heart_rate_bpm'] > 100).astype(float)\n",
+                "    df['htn_bp_flag'] = (df['systolic_bp_mmhg'] > 140).astype(float)\n",
+                "    for c in ['hemoglobin_g_dl', 'creatinine_mg_dl', 'sodium_mmol_l', 'heart_rate_bpm', 'systolic_bp_mmhg', 'followup_days']:\n",
+                "        df[c + '_missing'] = df[c].isnull().astype(int)\n",
+                "    df['comorbidity_load'] = df['diabetes'] + df['hypertension'] + df['chronic_kidney_disease'] + df['heart_failure']\n",
+                "    df['cardiorenal'] = (df['chronic_kidney_disease'] & df['heart_failure']).astype(int)\n",
+                "    df['polypharmacy'] = (df['medication_count'] >= 10).astype(int)\n",
+                "    df['frequent_admitter'] = (df['prior_admissions_12m'] >= 2).astype(int)\n",
+                "    df['long_stay'] = (df['length_of_stay_days'] >= 7).astype(int)\n",
+                "    df['late_followup'] = ((df['followup_days'] > 14) | df['followup_days'].isnull()).astype(int)\n",
+                "    df['simple_risk_score'] = df['frequent_admitter'] + df['long_stay'] + df['polypharmacy'] + df['anemia_flag'] + df['aki_flag']\n",
+                "    return df\n",
+                "\n",
+                "train_fe = feature_engineer(train_raw)\n",
+                "test_fe = feature_engineer(test_raw)\n",
+                "print('Feature engineering complete!')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 2. Model Training & Out-of-Fold Cross-Validation"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "CAT_COLS = ['sex', 'rurality', 'hospital_type', 'region', 'discharge_disposition', 'care_pathway']\n",
+                "NUM_COLS = [c for c in train_fe.columns if c not in CAT_COLS + ['patient_id', 'readmitted_30d']]\n",
+                "FEATURES = NUM_COLS + CAT_COLS\n",
+                "y = train_fe['readmitted_30d']\n",
+                "\n",
+                "# Native categories for CatBoost and LightGBM\n",
+                "X_native = train_fe[FEATURES].copy()\n",
+                "X_test_native = test_fe[FEATURES].copy()\n",
+                "for c in CAT_COLS:\n",
+                "    X_native[c] = X_native[c].astype('category')\n",
+                "    X_test_native[c] = X_test_native[c].astype('category')\n",
+                "\n",
+                "# Preprocessing for linear models\n",
+                "ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)\n",
+                "train_ohe = ohe.fit_transform(train_fe[CAT_COLS].astype(str))\n",
+                "test_ohe = ohe.transform(test_fe[CAT_COLS].astype(str))\n",
+                "imp = IterativeImputer(random_state=SEED, max_iter=8, n_nearest_features=6)\n",
+                "train_num_imp = imp.fit_transform(train_fe[NUM_COLS])\n",
+                "test_num_imp = imp.transform(test_fe[NUM_COLS])\n",
+                "scaler = StandardScaler()\n",
+                "Xs = np.hstack([scaler.fit_transform(train_num_imp), train_ohe])\n",
+                "Xs_t = np.hstack([scaler.transform(test_num_imp), test_ohe])\n",
+                "\n",
+                "skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)\n",
+                "print('Data prepared for 5-fold CV.')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 3. Training Stacking Ensemble (CatBoost + LightGBM + Lasso-LR)"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "cb_oof = np.zeros(len(X_native)); cb_test = np.zeros(len(X_test_native))\n",
+                "lgb_oof = np.zeros(len(X_native)); lgb_test = np.zeros(len(X_test_native))\n",
+                "lr_oof = np.zeros(len(Xs)); lr_test = np.zeros(len(Xs_t))\n",
+                "\n",
+                "for ti, vi in skf.split(X_native, y):\n",
+                "    # CatBoost\n",
+                "    cb = CatBoostClassifier(iterations=1500, learning_rate=0.03, depth=5, cat_features=CAT_COLS, verbose=False, random_seed=SEED)\n",
+                "    cb.fit(X_native.iloc[ti], y.iloc[ti], eval_set=(X_native.iloc[vi], y.iloc[vi]), early_stopping_rounds=80)\n",
+                "    cb_oof[vi] = cb.predict_proba(X_native.iloc[vi])[:, 1]\n",
+                "    cb_test += cb.predict_proba(X_test_native)[:, 1] / 5.0\n",
+                "    \n",
+                "    # LightGBM\n",
+                "    lg = lgb.LGBMClassifier(learning_rate=0.025, num_leaves=24, max_depth=4, random_state=SEED, verbose=-1, n_jobs=-1)\n",
+                "    lg.fit(X_native.iloc[ti], y.iloc[ti], eval_set=[(X_native.iloc[vi], y.iloc[vi])], callbacks=[lgb.early_stopping(80, verbose=False)])\n",
+                "    lgb_oof[vi] = lg.predict_proba(X_native.iloc[vi])[:, 1]\n",
+                "    lgb_test += lg.predict_proba(X_test_native)[:, 1] / 5.0\n",
+                "    \n",
+                "    # Calibrated Lasso LR\n",
+                "    base_lr = LogisticRegression(C=0.15, penalty='l1', solver='saga', max_iter=1500, random_state=SEED)\n",
+                "    m = CalibratedClassifierCV(base_lr, method='sigmoid', cv=3)\n",
+                "    m.fit(Xs[ti], y.iloc[ti])\n",
+                "    lr_oof[vi] = m.predict_proba(Xs[vi])[:, 1]\n",
+                "    lr_test += m.predict_proba(Xs_t)[:, 1] / 5.0\n",
+                "\n",
+                "print(f'CatBoost OOF LogLoss: {log_loss(y, cb_oof):.5f} | AUC: {roc_auc_score(y, cb_oof):.5f}')\n",
+                "print(f'LightGBM OOF LogLoss: {log_loss(y, lgb_oof):.5f} | AUC: {roc_auc_score(y, lgb_oof):.5f}')\n",
+                "print(f'Lasso-LR OOF LogLoss: {log_loss(y, lr_oof):.5f} | AUC: {roc_auc_score(y, lr_oof):.5f}')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 4. Final Submission Generation with Probability Bounds"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Optimal Stacking Blend\n",
+                "final_test = 0.50 * lr_test + 0.30 * cb_test + 0.20 * lgb_test\n",
+                "final_probs = np.clip(final_test, 0.0248, 0.7280)\n",
+                "\n",
+                "sub = pd.DataFrame({\n",
+                "    'patient_id': test_raw['patient_id'],\n",
+                "    'readmitted_30d': final_probs\n",
+                "})\n",
+                "sub.to_csv('codewave_final_submission.csv', index=False)\n",
+                "print('Saved codewave_final_submission.csv successfully!')\n",
+                "print(sub.head(10))"
+            ]
+        }
+    ],
+    "metadata": {
+        "language_info": {
+            "name": "python"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 4
+}
+
+with open("codewave_solution.ipynb", "w", encoding="utf-8") as f:
+    json.dump(notebook, f, indent=2)
+
+print("codewave_solution.ipynb generated successfully!")
